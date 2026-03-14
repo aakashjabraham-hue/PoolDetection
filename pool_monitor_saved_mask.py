@@ -5,14 +5,26 @@ import time
 import json
 import os
 import threading
+import base64
+import re
+import subprocess
+import platform
+import atexit
+import ctypes
+import shutil
 from collections import deque
 
 STREAM_URL         = "rtsp://192.168.68.75:8554/uppool"
 CHECK_INTERVAL     = 30
+AI_CHECK_INTERVAL  = 300
 DEBRIS_THRESHOLD   = 5.0   # Alert when debris covers more than this % of the pool
 
 BOT_TOKEN = "PUT_BOT_TOKEN_HERE"
 CHAT_ID   = "PUT_CHAT_ID_HERE"
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 
 MASK_FILE          = "pool_mask.json"
 COLOR_PROFILE_FILE = "pool_color_profile.json"
@@ -53,6 +65,62 @@ MAX_DECODE_ERRORS             = 10
 RECONNECT_DELAY               = 3
 
 
+
+
+# -------------------------
+# SLEEP PREVENTION (best effort)
+# -------------------------
+
+class SleepInhibitor:
+    def __init__(self):
+        self.proc = None
+        self.os_name = platform.system().lower()
+
+    def start(self):
+        try:
+            if "windows" in self.os_name:
+                # Prevent the machine from automatically sleeping while this process is active
+                ES_CONTINUOUS = 0x80000000
+                ES_SYSTEM_REQUIRED = 0x00000001
+                ES_AWAYMODE_REQUIRED = 0x00000040
+                ctypes.windll.kernel32.SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+                )
+                print("Sleep prevention enabled (Windows execution state)")
+                return
+
+            if "darwin" in self.os_name and shutil.which("caffeinate"):
+                self.proc = subprocess.Popen(["caffeinate", "-dimsu"])
+                print("Sleep prevention enabled via caffeinate")
+                return
+
+            if "linux" in self.os_name and shutil.which("systemd-inhibit"):
+                self.proc = subprocess.Popen([
+                    "systemd-inhibit",
+                    "--what=sleep",
+                    "--why=Pool monitor is running",
+                    "bash",
+                    "-lc",
+                    "while true; do sleep 3600; done",
+                ])
+                print("Sleep prevention enabled via systemd-inhibit")
+                return
+
+            print("Sleep prevention unavailable on this OS/environment")
+        except Exception as e:
+            print(f"Sleep prevention setup failed: {e}")
+
+    def stop(self):
+        try:
+            if "windows" in self.os_name:
+                ES_CONTINUOUS = 0x80000000
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            if self.proc is not None:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+        except Exception:
+            pass
+
 # -------------------------
 # TELEGRAM
 # -------------------------
@@ -64,6 +132,106 @@ def send_alert(pct):
         requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=5)
     except Exception as e:
         print(f"Alert failed: {e}")
+
+
+# -------------------------
+# OPENROUTER AI DETECTION
+# -------------------------
+
+def frame_to_jpeg_base64(frame):
+    ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        return None
+    return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+
+def extract_json(text):
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?", "", stripped).strip()
+        stripped = re.sub(r"```$", "", stripped).strip()
+    try:
+        return json.loads(stripped)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            return json.loads(m.group(0))
+    return None
+
+
+def request_ai_debris_boxes(frame):
+    if not OPENROUTER_API_KEY:
+        return []
+
+    image_b64 = frame_to_jpeg_base64(frame)
+    if image_b64 is None:
+        return []
+
+    prompt = (
+        "You are analyzing a pool image. The blue polygon outlines the valid pool surface area. "
+        "Only identify debris inside that blue polygon. Ignore everything outside the polygon and ignore reflections. "
+        "Return STRICT JSON only in this format: "
+        "{\"debris\":[{\"label\":\"leaf\",\"bbox\":{\"x\":0.1,\"y\":0.2,\"w\":0.05,\"h\":0.04}}]} "
+        "where x,y,w,h are normalized to [0,1] relative to full image width/height. "
+        "If no debris exists, return {\"debris\":[]}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+            ]
+        }],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=45)
+        r.raise_for_status()
+        data = r.json()
+        text = data["choices"][0]["message"]["content"]
+        parsed = extract_json(text)
+        if not parsed or "debris" not in parsed:
+            return []
+        return parsed["debris"]
+    except Exception as e:
+        print(f"AI detection request failed: {e}")
+        return []
+
+
+def boxes_to_mask(boxes, frame_shape):
+    h, w = frame_shape[:2]
+    ai_mask = np.zeros((h, w), dtype=np.uint8)
+
+    for item in boxes:
+        bbox = item.get("bbox", {}) if isinstance(item, dict) else {}
+        try:
+            x = float(bbox.get("x", 0.0))
+            y = float(bbox.get("y", 0.0))
+            bw = float(bbox.get("w", 0.0))
+            bh = float(bbox.get("h", 0.0))
+        except Exception:
+            continue
+
+        x1 = int(max(min(x, 1.0), 0.0) * w)
+        y1 = int(max(min(y, 1.0), 0.0) * h)
+        x2 = int(max(min(x + bw, 1.0), 0.0) * w)
+        y2 = int(max(min(y + bh, 1.0), 0.0) * h)
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+        cv2.rectangle(ai_mask, (x1, y1), (x2, y2), 255, -1)
+
+    ai_mask = cv2.bitwise_and(ai_mask, get_pool_binary_mask(frame_shape))
+    return ai_mask
 
 
 # -------------------------
@@ -379,11 +547,18 @@ recalibrate_flag = False
 debug_mode       = False
 alert_sent       = False
 last_check       = time.time()
+last_ai_check    = 0
+ai_debris_mask   = None
+ai_debris_pct    = 0.0
 
 print("\nPool monitor running")
 print("Press 'c' to recalibrate water color")
 print("Press 'd' to toggle debug view")
 print("Press ESC to quit\n")
+
+sleep_inhibitor = SleepInhibitor()
+sleep_inhibitor.start()
+atexit.register(sleep_inhibitor.stop)
 
 
 # -------------------------
@@ -393,6 +568,7 @@ print("Press ESC to quit\n")
 def processing_loop():
     global alert_sent, last_check, latest_display, latest_debug
     global recalibrate_flag, water_mean, water_std, cap
+    global last_ai_check, ai_debris_mask, ai_debris_pct
 
     consecutive_errors = 0
 
@@ -475,12 +651,33 @@ def processing_loop():
                 alert_sent = False
             last_check = now
 
+        if OPENROUTER_API_KEY and (now - last_ai_check > AI_CHECK_INTERVAL):
+            ai_boxes = request_ai_debris_boxes(display)
+            new_ai_mask = boxes_to_mask(ai_boxes, frame.shape)
+            ai_area = np.count_nonzero(new_ai_mask)
+            ai_debris_mask = new_ai_mask
+            ai_debris_pct = min((ai_area / pool_area) * 100.0, 100.0)
+            print(f"AI debris coverage: {ai_debris_pct:.1f}%")
+            last_ai_check = now
+
         # Overlay
         cv2.polylines(display, [POOL_POLYGON], True, (255, 0, 0), 2)
 
         bar_color = (0, 0, 255) if debris_pct >= DEBRIS_THRESHOLD else (0, 255, 0)
         cv2.putText(display, f"Debris: {debris_pct:.1f}%", (10, 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, bar_color, 2)
+
+        if OPENROUTER_API_KEY:
+            cv2.putText(display, f"AI Debris: {ai_debris_pct:.1f}%", (10, 85),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+            if ai_debris_mask is not None:
+                ai_contours, _ = cv2.findContours(ai_debris_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for c in ai_contours:
+                    area = cv2.contourArea(c)
+                    if area < MIN_CONTOUR_AREA:
+                        continue
+                    x, y, w, h = cv2.boundingRect(c)
+                    cv2.rectangle(display, (x, y), (x + w, y + h), (255, 0, 255), 2)
 
         # Small coverage bar under the text
         bar_w = 200
@@ -543,4 +740,5 @@ while True:
 
 
 cap.release()
+sleep_inhibitor.stop()
 cv2.destroyAllWindows()
