@@ -7,6 +7,11 @@ import os
 import threading
 import base64
 import re
+import subprocess
+import platform
+import atexit
+import ctypes
+import shutil
 from collections import deque
 
 STREAM_URL         = "rtsp://192.168.68.75:8554/uppool"
@@ -59,6 +64,62 @@ MOTION_CONFIRM_RATIO          = 0.08
 MAX_DECODE_ERRORS             = 10
 RECONNECT_DELAY               = 3
 
+
+
+
+# -------------------------
+# SLEEP PREVENTION (best effort)
+# -------------------------
+
+class SleepInhibitor:
+    def __init__(self):
+        self.proc = None
+        self.os_name = platform.system().lower()
+
+    def start(self):
+        try:
+            if "windows" in self.os_name:
+                # Prevent the machine from automatically sleeping while this process is active
+                ES_CONTINUOUS = 0x80000000
+                ES_SYSTEM_REQUIRED = 0x00000001
+                ES_AWAYMODE_REQUIRED = 0x00000040
+                ctypes.windll.kernel32.SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+                )
+                print("Sleep prevention enabled (Windows execution state)")
+                return
+
+            if "darwin" in self.os_name and shutil.which("caffeinate"):
+                self.proc = subprocess.Popen(["caffeinate", "-dimsu"])
+                print("Sleep prevention enabled via caffeinate")
+                return
+
+            if "linux" in self.os_name and shutil.which("systemd-inhibit"):
+                self.proc = subprocess.Popen([
+                    "systemd-inhibit",
+                    "--what=sleep",
+                    "--why=Pool monitor is running",
+                    "bash",
+                    "-lc",
+                    "while true; do sleep 3600; done",
+                ])
+                print("Sleep prevention enabled via systemd-inhibit")
+                return
+
+            print("Sleep prevention unavailable on this OS/environment")
+        except Exception as e:
+            print(f"Sleep prevention setup failed: {e}")
+
+    def stop(self):
+        try:
+            if "windows" in self.os_name:
+                ES_CONTINUOUS = 0x80000000
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            if self.proc is not None:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+        except Exception:
+            pass
 
 # -------------------------
 # TELEGRAM
@@ -495,6 +556,10 @@ print("Press 'c' to recalibrate water color")
 print("Press 'd' to toggle debug view")
 print("Press ESC to quit\n")
 
+sleep_inhibitor = SleepInhibitor()
+sleep_inhibitor.start()
+atexit.register(sleep_inhibitor.stop)
+
 
 # -------------------------
 # PROCESSING THREAD
@@ -675,4 +740,5 @@ while True:
 
 
 cap.release()
+sleep_inhibitor.stop()
 cv2.destroyAllWindows()
