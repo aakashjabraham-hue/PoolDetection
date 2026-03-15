@@ -22,6 +22,13 @@ COLOR_PROFILE_FILE = "pool_color_profile.json"
 # -------------------------
 
 MIN_CONTOUR_AREA  = 40
+PERSISTENCE_FRAMES_REQUIRED = 12
+TRACK_MAX_MISSING_FRAMES    = 10
+TRACK_MATCH_DISTANCE_PX     = 55
+
+BG_LEARNING_RATE            = 0.005
+BG_DIFF_THRESHOLD           = 28
+BG_CONFIRM_RATIO            = 0.12
 
 DEBRIS_COLOR_RANGES = [
     # --- Leaves ---
@@ -334,6 +341,109 @@ def build_motion_mask(masked_frame):
 
 
 # -------------------------
+# BACKGROUND DIFFERENCE (secondary confirmer)
+# -------------------------
+
+background_gray = None
+
+
+def build_background_diff_mask(masked_frame):
+    global background_gray
+
+    gray = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2GRAY)
+
+    if background_gray is None:
+        background_gray = gray.astype(np.float32)
+        return np.zeros(gray.shape, dtype=np.uint8)
+
+    bg_u8 = cv2.convertScaleAbs(background_gray)
+    diff = cv2.absdiff(gray, bg_u8)
+    _, diff_mask = cv2.threshold(diff, BG_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+
+    diff_mask = cv2.bitwise_and(diff_mask, get_pool_binary_mask(masked_frame.shape))
+    k = np.ones((3, 3), np.uint8)
+    diff_mask = cv2.morphologyEx(diff_mask, cv2.MORPH_OPEN, k)
+    diff_mask = cv2.morphologyEx(diff_mask, cv2.MORPH_CLOSE, k)
+
+    cv2.accumulateWeighted(gray.astype(np.float32), background_gray, BG_LEARNING_RATE)
+
+    return diff_mask
+
+
+# -------------------------
+# SIMPLE BLOB PERSISTENCE TRACKER
+# -------------------------
+
+tracks = {}
+next_track_id = 1
+
+
+def _contour_centroid(contour):
+    m = cv2.moments(contour)
+    if m["m00"] == 0:
+        return None
+    return np.array([m["m10"] / m["m00"], m["m01"] / m["m00"]], dtype=np.float32)
+
+
+def update_tracks(contours):
+    global next_track_id
+
+    detected = []
+    for c in contours:
+        centroid = _contour_centroid(c)
+        if centroid is None:
+            continue
+        detected.append({"contour": c, "centroid": centroid})
+
+    matched_track_ids = set()
+
+    for d in detected:
+        best_tid = None
+        best_dist = float("inf")
+
+        for tid, t in tracks.items():
+            if tid in matched_track_ids:
+                continue
+            dist = float(np.linalg.norm(d["centroid"] - t["centroid"]))
+            if dist < best_dist and dist <= TRACK_MATCH_DISTANCE_PX:
+                best_dist = dist
+                best_tid = tid
+
+        if best_tid is None:
+            tid = next_track_id
+            next_track_id += 1
+            tracks[tid] = {
+                "centroid": d["centroid"],
+                "hits": 1,
+                "missing": 0,
+                "contour": d["contour"],
+            }
+            matched_track_ids.add(tid)
+        else:
+            tracks[best_tid]["centroid"] = d["centroid"]
+            tracks[best_tid]["hits"] += 1
+            tracks[best_tid]["missing"] = 0
+            tracks[best_tid]["contour"] = d["contour"]
+            matched_track_ids.add(best_tid)
+
+    stale_ids = []
+    for tid, t in tracks.items():
+        if tid not in matched_track_ids:
+            t["missing"] += 1
+            if t["missing"] > TRACK_MAX_MISSING_FRAMES:
+                stale_ids.append(tid)
+
+    for tid in stale_ids:
+        del tracks[tid]
+
+    return [
+        t["contour"]
+        for t in tracks.values()
+        if t["hits"] >= PERSISTENCE_FRAMES_REQUIRED and t["missing"] == 0
+    ]
+
+
+# -------------------------
 # DEBUG PANEL
 # -------------------------
 
@@ -430,31 +540,47 @@ def processing_loop():
         masked      = mask_pool(frame)
         hsv         = cv2.cvtColor(masked, cv2.COLOR_BGR2HSV)
         motion_mask = build_motion_mask(masked)
+        bg_diff_mask = build_background_diff_mask(masked)
 
         if is_debug:
             debris_mask, raw, water_mask, refl_mask = build_debris_mask_debug(hsv)
         else:
             debris_mask = build_debris_mask(hsv)
 
-        # Find contours and apply motion confirmation
+        # Find contours, apply confirmation checks, then persistence gating
         contours, _ = cv2.findContours(debris_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        confirmed_area = 0
+        candidates = []
 
         for c in contours:
             area = cv2.contourArea(c)
             if area < MIN_CONTOUR_AREA:
                 continue
 
+            blob = np.zeros(frame.shape[:2], dtype=np.uint8)
+            cv2.drawContours(blob, [c], -1, 255, -1)
+            dilated = cv2.dilate(blob, np.ones((CONFIRM_DILATE, CONFIRM_DILATE), np.uint8))
+
             if MOTION_CONFIRM_RATIO > 0:
-                blob = np.zeros(frame.shape[:2], dtype=np.uint8)
-                cv2.drawContours(blob, [c], -1, 255, -1)
-                dilated        = cv2.dilate(blob, np.ones((CONFIRM_DILATE, CONFIRM_DILATE), np.uint8))
-                overlap        = np.count_nonzero(cv2.bitwise_and(dilated, motion_mask))
-                blob_px        = np.count_nonzero(blob)
-                if blob_px > 0 and (overlap / blob_px) < MOTION_CONFIRM_RATIO:
+                motion_overlap = np.count_nonzero(cv2.bitwise_and(dilated, motion_mask))
+                blob_px = np.count_nonzero(blob)
+                if blob_px > 0 and (motion_overlap / blob_px) < MOTION_CONFIRM_RATIO:
                     continue
 
+            if BG_CONFIRM_RATIO > 0:
+                bg_overlap = np.count_nonzero(cv2.bitwise_and(dilated, bg_diff_mask))
+                blob_px = np.count_nonzero(blob)
+                if blob_px > 0 and (bg_overlap / blob_px) < BG_CONFIRM_RATIO:
+                    continue
+
+            candidates.append(c)
+
+        confirmed_contours = update_tracks(candidates)
+
+        confirmed_area = 0
+
+        for c in confirmed_contours:
+            area = cv2.contourArea(c)
             confirmed_area += area
             x, y, w, h = cv2.boundingRect(c)
             cv2.rectangle(display, (x, y), (x + w, y + h), (0, 165, 255), 2)
