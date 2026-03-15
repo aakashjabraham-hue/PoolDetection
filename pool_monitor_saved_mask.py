@@ -5,14 +5,26 @@ import time
 import json
 import os
 import threading
+import base64
+import re
+import subprocess
+import platform
+import atexit
+import ctypes
+import shutil
 from collections import deque
 
 STREAM_URL         = "rtsp://192.168.68.75:8554/uppool"
 CHECK_INTERVAL     = 30
+AI_CHECK_INTERVAL  = 60
 DEBRIS_THRESHOLD   = 5.0   # Alert when debris covers more than this % of the pool
 
 BOT_TOKEN = "PUT_BOT_TOKEN_HERE"
 CHAT_ID   = "PUT_CHAT_ID_HERE"
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 
 MASK_FILE          = "pool_mask.json"
 COLOR_PROFILE_FILE = "pool_color_profile.json"
@@ -22,6 +34,13 @@ COLOR_PROFILE_FILE = "pool_color_profile.json"
 # -------------------------
 
 MIN_CONTOUR_AREA  = 40
+PERSISTENCE_FRAMES_REQUIRED = 12
+TRACK_MAX_MISSING_FRAMES    = 10
+TRACK_MATCH_DISTANCE_PX     = 55
+
+BG_LEARNING_RATE            = 0.005
+BG_DIFF_THRESHOLD           = 28
+BG_CONFIRM_RATIO            = 0.12
 
 DEBRIS_COLOR_RANGES = [
     # --- Leaves ---
@@ -54,6 +73,60 @@ RECONNECT_DELAY               = 3
 
 
 # -------------------------
+# SLEEP PREVENTION (best effort)
+# -------------------------
+
+class SleepInhibitor:
+    def __init__(self):
+        self.proc = None
+        self.os_name = platform.system().lower()
+
+    def start(self):
+        try:
+            if "windows" in self.os_name:
+                ES_CONTINUOUS = 0x80000000
+                ES_SYSTEM_REQUIRED = 0x00000001
+                ES_AWAYMODE_REQUIRED = 0x00000040
+                ctypes.windll.kernel32.SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+                )
+                print("Sleep prevention enabled (Windows execution state)")
+                return
+
+            if "darwin" in self.os_name and shutil.which("caffeinate"):
+                self.proc = subprocess.Popen(["caffeinate", "-dimsu"])
+                print("Sleep prevention enabled via caffeinate")
+                return
+
+            if "linux" in self.os_name and shutil.which("systemd-inhibit"):
+                self.proc = subprocess.Popen([
+                    "systemd-inhibit",
+                    "--what=sleep",
+                    "--why=Pool monitor is running",
+                    "bash",
+                    "-lc",
+                    "while true; do sleep 3600; done",
+                ])
+                print("Sleep prevention enabled via systemd-inhibit")
+                return
+
+            print("Sleep prevention unavailable on this OS/environment")
+        except Exception as e:
+            print(f"Sleep prevention setup failed: {e}")
+
+    def stop(self):
+        try:
+            if "windows" in self.os_name:
+                ES_CONTINUOUS = 0x80000000
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            if self.proc is not None:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+# -------------------------
 # TELEGRAM
 # -------------------------
 
@@ -64,6 +137,106 @@ def send_alert(pct):
         requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=5)
     except Exception as e:
         print(f"Alert failed: {e}")
+
+
+# -------------------------
+# OPENROUTER AI DETECTION
+# -------------------------
+
+def frame_to_jpeg_base64(frame):
+    ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        return None
+    return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+
+def extract_json(text):
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?", "", stripped).strip()
+        stripped = re.sub(r"```$", "", stripped).strip()
+    try:
+        return json.loads(stripped)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            return json.loads(m.group(0))
+    return None
+
+
+def request_ai_debris_boxes(frame):
+    if not OPENROUTER_API_KEY:
+        return []
+
+    image_b64 = frame_to_jpeg_base64(frame)
+    if image_b64 is None:
+        return []
+
+    prompt = (
+        "You are analyzing a pool image. The blue polygon outlines the valid pool surface area. "
+        "Only identify debris inside that blue polygon. Ignore everything outside the polygon and ignore reflections. "
+        "Return STRICT JSON only in this format: "
+        "{\"debris\":[{\"label\":\"leaf\",\"bbox\":{\"x\":0.1,\"y\":0.2,\"w\":0.05,\"h\":0.04}}]} "
+        "where x,y,w,h are normalized to [0,1] relative to full image width/height. "
+        "If no debris exists, return {\"debris\":[]}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+            ]
+        }],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=45)
+        r.raise_for_status()
+        data = r.json()
+        text = data["choices"][0]["message"]["content"]
+        parsed = extract_json(text)
+        if not parsed or "debris" not in parsed:
+            return []
+        return parsed["debris"]
+    except Exception as e:
+        print(f"AI detection request failed: {e}")
+        return []
+
+
+def boxes_to_mask(boxes, frame_shape):
+    h, w = frame_shape[:2]
+    ai_mask = np.zeros((h, w), dtype=np.uint8)
+
+    for item in boxes:
+        bbox = item.get("bbox", {}) if isinstance(item, dict) else {}
+        try:
+            x = float(bbox.get("x", 0.0))
+            y = float(bbox.get("y", 0.0))
+            bw = float(bbox.get("w", 0.0))
+            bh = float(bbox.get("h", 0.0))
+        except Exception:
+            continue
+
+        x1 = int(max(min(x, 1.0), 0.0) * w)
+        y1 = int(max(min(y, 1.0), 0.0) * h)
+        x2 = int(max(min(x + bw, 1.0), 0.0) * w)
+        y2 = int(max(min(y + bh, 1.0), 0.0) * h)
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+        cv2.rectangle(ai_mask, (x1, y1), (x2, y2), 255, -1)
+
+    ai_mask = cv2.bitwise_and(ai_mask, get_pool_binary_mask(frame_shape))
+    return ai_mask
 
 
 # -------------------------
@@ -108,12 +281,9 @@ def save_water_profile(mean, std):
 
 # -------------------------
 # SETUP HELPERS
-# These run on the main thread BEFORE the processing thread starts,
-# so there's no contention over cv2 windows.
 # -------------------------
 
 def run_pool_mask_setup(cap):
-    """Interactive polygon selection. Returns np.array of points."""
     ret, frame = cap.read()
     if not ret:
         print("Could not read frame for mask setup")
@@ -148,7 +318,6 @@ def run_pool_mask_setup(cap):
 
 
 def run_water_calibration(cap):
-    """Interactive water color sampling. Returns (mean, std) HSV arrays."""
     ret, frame = cap.read()
     if not ret:
         print("Could not read frame for calibration")
@@ -198,7 +367,7 @@ if not cap.isOpened():
 
 
 # -------------------------
-# SETUP (all on main thread, before any processing thread starts)
+# SETUP
 # -------------------------
 
 POOL_POLYGON = load_mask()
@@ -209,9 +378,8 @@ water_mean, water_std = load_water_profile()
 if water_mean is None:
     water_mean, water_std = run_water_calibration(cap)
 
-# Compute pool area in pixels once — used for percentage calculation
-_pool_mask_ref = np.zeros((1080, 1920), dtype=np.uint8)   # placeholder shape
-POOL_AREA_PX   = None   # computed from first real frame
+POOL_AREA_PX = None
+POOL_BINARY_MASK = None
 
 
 def get_pool_area(frame_shape):
@@ -223,20 +391,12 @@ def get_pool_area(frame_shape):
     return POOL_AREA_PX
 
 
-# -------------------------
-# POOL BINARY MASK
-# -------------------------
-
-POOL_BINARY_MASK = None
-
-
 def get_pool_binary_mask(frame_shape):
     global POOL_BINARY_MASK
     if POOL_BINARY_MASK is None:
         m = np.zeros(frame_shape[:2], dtype=np.uint8)
         cv2.fillPoly(m, [POOL_POLYGON], 255)
         POOL_BINARY_MASK = m
-        # Also set pool area while we're here
         get_pool_area(frame_shape)
     return POOL_BINARY_MASK
 
@@ -257,10 +417,10 @@ def build_reflection_mask(hsv_frame):
     v_buffer.append(v_channel.astype(np.float32))
     if len(v_buffer) < 3:
         return np.zeros(v_channel.shape, dtype=np.uint8)
-    variance     = np.std(np.stack(v_buffer, axis=0), axis=0)
-    bright_mask  = (v_channel > REFLECTION_V_THRESHOLD).astype(np.uint8) * 255
-    flicker_mask = (variance  > REFLECTION_VARIANCE_THRESHOLD).astype(np.uint8) * 255
-    reflection   = cv2.bitwise_and(bright_mask, flicker_mask)
+    variance = np.std(np.stack(v_buffer, axis=0), axis=0)
+    bright_mask = (v_channel > REFLECTION_V_THRESHOLD).astype(np.uint8) * 255
+    flicker_mask = (variance > REFLECTION_VARIANCE_THRESHOLD).astype(np.uint8) * 255
+    reflection = cv2.bitwise_and(bright_mask, flicker_mask)
     return cv2.dilate(reflection, np.ones((9, 9), np.uint8))
 
 
@@ -271,13 +431,11 @@ def build_reflection_mask(hsv_frame):
 def build_debris_mask(hsv_frame):
     debris = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
     for (lo, hi) in DEBRIS_COLOR_RANGES:
-        debris |= cv2.inRange(hsv_frame,
-                              np.array(lo, dtype=np.uint8),
-                              np.array(hi, dtype=np.uint8))
+        debris |= cv2.inRange(hsv_frame, np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8))
 
-    sigma     = 2.5
-    water_lo  = np.clip(water_mean - sigma * water_std, 0, 255).astype(np.uint8)
-    water_hi  = np.clip(water_mean + sigma * water_std, 0, 255).astype(np.uint8)
+    sigma = 2.5
+    water_lo = np.clip(water_mean - sigma * water_std, 0, 255).astype(np.uint8)
+    water_hi = np.clip(water_mean + sigma * water_std, 0, 255).astype(np.uint8)
     water_mask = cv2.inRange(hsv_frame, water_lo, water_hi)
 
     debris = cv2.bitwise_and(debris, cv2.bitwise_not(water_mask))
@@ -285,30 +443,27 @@ def build_debris_mask(hsv_frame):
     debris = cv2.bitwise_and(debris, get_pool_binary_mask(hsv_frame.shape))
 
     k = np.ones((5, 5), np.uint8)
-    debris = cv2.morphologyEx(debris, cv2.MORPH_OPEN,  k)
+    debris = cv2.morphologyEx(debris, cv2.MORPH_OPEN, k)
     debris = cv2.morphologyEx(debris, cv2.MORPH_CLOSE, k)
     return debris
 
 
 def build_debris_mask_debug(hsv_frame):
-    """Returns final mask plus intermediates for debug view."""
     raw = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
     for (lo, hi) in DEBRIS_COLOR_RANGES:
-        raw |= cv2.inRange(hsv_frame,
-                           np.array(lo, dtype=np.uint8),
-                           np.array(hi, dtype=np.uint8))
+        raw |= cv2.inRange(hsv_frame, np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8))
 
-    sigma      = 2.5
-    water_lo   = np.clip(water_mean - sigma * water_std, 0, 255).astype(np.uint8)
-    water_hi   = np.clip(water_mean + sigma * water_std, 0, 255).astype(np.uint8)
+    sigma = 2.5
+    water_lo = np.clip(water_mean - sigma * water_std, 0, 255).astype(np.uint8)
+    water_hi = np.clip(water_mean + sigma * water_std, 0, 255).astype(np.uint8)
     water_mask = cv2.inRange(hsv_frame, water_lo, water_hi)
-    refl_mask  = build_reflection_mask(hsv_frame)
+    refl_mask = build_reflection_mask(hsv_frame)
 
-    final = cv2.bitwise_and(raw,   cv2.bitwise_not(water_mask))
+    final = cv2.bitwise_and(raw, cv2.bitwise_not(water_mask))
     final = cv2.bitwise_and(final, cv2.bitwise_not(refl_mask))
     final = cv2.bitwise_and(final, get_pool_binary_mask(hsv_frame.shape))
-    k     = np.ones((5, 5), np.uint8)
-    final = cv2.morphologyEx(final, cv2.MORPH_OPEN,  k)
+    k = np.ones((5, 5), np.uint8)
+    final = cv2.morphologyEx(final, cv2.MORPH_OPEN, k)
     final = cv2.morphologyEx(final, cv2.MORPH_CLOSE, k)
 
     return final, raw, water_mask, refl_mask
@@ -318,9 +473,7 @@ def build_debris_mask_debug(hsv_frame):
 # MOTION MASK (secondary confirmer)
 # -------------------------
 
-bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-    history=800, varThreshold=30, detectShadows=True
-)
+bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=800, varThreshold=30, detectShadows=True)
 fg_buffer = deque(maxlen=4)
 
 
@@ -334,11 +487,106 @@ def build_motion_mask(masked_frame):
 
 
 # -------------------------
+# BACKGROUND DIFFERENCE (secondary confirmer)
+# -------------------------
+
+background_gray = None
+
+
+def build_background_diff_mask(masked_frame):
+    global background_gray
+
+    gray = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2GRAY)
+    if background_gray is None:
+        background_gray = gray.astype(np.float32)
+        return np.zeros(gray.shape, dtype=np.uint8)
+
+    bg_u8 = cv2.convertScaleAbs(background_gray)
+    diff = cv2.absdiff(gray, bg_u8)
+    _, diff_mask = cv2.threshold(diff, BG_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+
+    diff_mask = cv2.bitwise_and(diff_mask, get_pool_binary_mask(masked_frame.shape))
+    k = np.ones((3, 3), np.uint8)
+    diff_mask = cv2.morphologyEx(diff_mask, cv2.MORPH_OPEN, k)
+    diff_mask = cv2.morphologyEx(diff_mask, cv2.MORPH_CLOSE, k)
+
+    cv2.accumulateWeighted(gray.astype(np.float32), background_gray, BG_LEARNING_RATE)
+    return diff_mask
+
+
+# -------------------------
+# SIMPLE BLOB PERSISTENCE TRACKER
+# -------------------------
+
+tracks = {}
+next_track_id = 1
+
+
+def _contour_centroid(contour):
+    m = cv2.moments(contour)
+    if m["m00"] == 0:
+        return None
+    return np.array([m["m10"] / m["m00"], m["m01"] / m["m00"]], dtype=np.float32)
+
+
+def update_tracks(contours):
+    global next_track_id
+
+    detected = []
+    for c in contours:
+        centroid = _contour_centroid(c)
+        if centroid is None:
+            continue
+        detected.append({"contour": c, "centroid": centroid})
+
+    matched_track_ids = set()
+
+    for d in detected:
+        best_tid = None
+        best_dist = float("inf")
+        for tid, t in tracks.items():
+            if tid in matched_track_ids:
+                continue
+            dist = float(np.linalg.norm(d["centroid"] - t["centroid"]))
+            if dist < best_dist and dist <= TRACK_MATCH_DISTANCE_PX:
+                best_dist = dist
+                best_tid = tid
+
+        if best_tid is None:
+            tid = next_track_id
+            next_track_id += 1
+            tracks[tid] = {"centroid": d["centroid"], "hits": 1, "missing": 0, "contour": d["contour"]}
+            matched_track_ids.add(tid)
+        else:
+            tracks[best_tid]["centroid"] = d["centroid"]
+            tracks[best_tid]["hits"] += 1
+            tracks[best_tid]["missing"] = 0
+            tracks[best_tid]["contour"] = d["contour"]
+            matched_track_ids.add(best_tid)
+
+    stale_ids = []
+    for tid, t in tracks.items():
+        if tid not in matched_track_ids:
+            t["missing"] += 1
+            if t["missing"] > TRACK_MAX_MISSING_FRAMES:
+                stale_ids.append(tid)
+
+    for tid in stale_ids:
+        del tracks[tid]
+
+    return [
+        t["contour"]
+        for t in tracks.values()
+        if t["hits"] >= PERSISTENCE_FRAMES_REQUIRED and t["missing"] == 0
+    ]
+
+
+# -------------------------
 # DEBUG PANEL
 # -------------------------
 
 def make_debug_panel(frame, raw, water_mask, refl_mask, final_mask):
-    h, w   = frame.shape[:2]
+    h, w = frame.shape[:2]
     th, tw = h // 2, w // 2
 
     def tile(mask, color, title):
@@ -348,10 +596,14 @@ def make_debug_panel(frame, raw, water_mask, refl_mask, final_mask):
         cv2.putText(t, title, (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
         return t
 
-    top = np.hstack([tile(raw,        (0, 200, 255), "1. Raw color match"),
-                     tile(water_mask, (255, 180, 0),  "2. Water exclusion")])
-    bot = np.hstack([tile(refl_mask,  (0, 80,  255), "3. Reflection mask"),
-                     tile(final_mask, (0, 255,  80), "4. Final debris mask")])
+    top = np.hstack([
+        tile(raw, (0, 200, 255), "1. Raw color match"),
+        tile(water_mask, (255, 180, 0), "2. Water exclusion")
+    ])
+    bot = np.hstack([
+        tile(refl_mask, (0, 80, 255), "3. Reflection mask"),
+        tile(final_mask, (0, 255, 80), "4. Final debris mask")
+    ])
     return np.vstack([top, bot])
 
 
@@ -372,18 +624,25 @@ def read_frame_safe(capture):
 # SHARED STATE
 # -------------------------
 
-lock             = threading.Lock()
-latest_display   = None
-latest_debug     = None
+lock = threading.Lock()
+latest_display = None
+latest_debug = None
 recalibrate_flag = False
-debug_mode       = False
-alert_sent       = False
-last_check       = time.time()
+debug_mode = False
+alert_sent = False
+last_check = time.time()
+last_ai_check = 0
+ai_debris_mask = None
+ai_debris_pct = 0.0
 
 print("\nPool monitor running")
 print("Press 'c' to recalibrate water color")
 print("Press 'd' to toggle debug view")
 print("Press ESC to quit\n")
+
+sleep_inhibitor = SleepInhibitor()
+sleep_inhibitor.start()
+atexit.register(sleep_inhibitor.stop)
 
 
 # -------------------------
@@ -393,17 +652,17 @@ print("Press ESC to quit\n")
 def processing_loop():
     global alert_sent, last_check, latest_display, latest_debug
     global recalibrate_flag, water_mean, water_std, cap
+    global last_ai_check, ai_debris_mask, ai_debris_pct
 
     consecutive_errors = 0
 
     while True:
-
         ok, frame = read_frame_safe(cap)
 
         if not ok:
             consecutive_errors += 1
             if consecutive_errors >= MAX_DECODE_ERRORS:
-                print(f"Stream error — reconnecting...")
+                print("Stream error — reconnecting...")
                 cap.release()
                 time.sleep(RECONNECT_DELAY)
                 cap = cv2.VideoCapture(STREAM_URL)
@@ -418,52 +677,58 @@ def processing_loop():
         consecutive_errors = 0
 
         with lock:
-            do_recal = recalibrate_flag
             is_debug = debug_mode
-            recalibrate_flag = False
 
-        # Recalibration is triggered by main thread but executed here so the
-        # calibration window opens on the main thread via a flag — see below.
-        # (Recal window is handled in the main loop instead.)
-
-        display     = frame.copy()
-        masked      = mask_pool(frame)
-        hsv         = cv2.cvtColor(masked, cv2.COLOR_BGR2HSV)
+        display = frame.copy()
+        masked = mask_pool(frame)
+        hsv = cv2.cvtColor(masked, cv2.COLOR_BGR2HSV)
         motion_mask = build_motion_mask(masked)
+        bg_diff_mask = build_background_diff_mask(masked)
 
         if is_debug:
             debris_mask, raw, water_mask, refl_mask = build_debris_mask_debug(hsv)
         else:
             debris_mask = build_debris_mask(hsv)
 
-        # Find contours and apply motion confirmation
         contours, _ = cv2.findContours(debris_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        confirmed_area = 0
+        candidates = []
 
         for c in contours:
             area = cv2.contourArea(c)
             if area < MIN_CONTOUR_AREA:
                 continue
 
+            blob = np.zeros(frame.shape[:2], dtype=np.uint8)
+            cv2.drawContours(blob, [c], -1, 255, -1)
+            dilated = cv2.dilate(blob, np.ones((CONFIRM_DILATE, CONFIRM_DILATE), np.uint8))
+            blob_px = np.count_nonzero(blob)
+            if blob_px == 0:
+                continue
+
             if MOTION_CONFIRM_RATIO > 0:
-                blob = np.zeros(frame.shape[:2], dtype=np.uint8)
-                cv2.drawContours(blob, [c], -1, 255, -1)
-                dilated        = cv2.dilate(blob, np.ones((CONFIRM_DILATE, CONFIRM_DILATE), np.uint8))
-                overlap        = np.count_nonzero(cv2.bitwise_and(dilated, motion_mask))
-                blob_px        = np.count_nonzero(blob)
-                if blob_px > 0 and (overlap / blob_px) < MOTION_CONFIRM_RATIO:
+                motion_overlap = np.count_nonzero(cv2.bitwise_and(dilated, motion_mask))
+                if (motion_overlap / blob_px) < MOTION_CONFIRM_RATIO:
                     continue
 
+            if BG_CONFIRM_RATIO > 0:
+                bg_overlap = np.count_nonzero(cv2.bitwise_and(dilated, bg_diff_mask))
+                if (bg_overlap / blob_px) < BG_CONFIRM_RATIO:
+                    continue
+
+            candidates.append(c)
+
+        confirmed_contours = update_tracks(candidates)
+
+        confirmed_area = 0
+        for c in confirmed_contours:
+            area = cv2.contourArea(c)
             confirmed_area += area
             x, y, w, h = cv2.boundingRect(c)
             cv2.rectangle(display, (x, y), (x + w, y + h), (0, 165, 255), 2)
 
-        # Convert to percentage of pool area
-        pool_area  = get_pool_area(frame.shape)
+        pool_area = get_pool_area(frame.shape)
         debris_pct = min((confirmed_area / pool_area) * 100.0, 100.0)
 
-        # Periodic alert
         now = time.time()
         if now - last_check > CHECK_INTERVAL:
             print(f"Debris coverage: {debris_pct:.1f}%")
@@ -475,14 +740,33 @@ def processing_loop():
                 alert_sent = False
             last_check = now
 
-        # Overlay
+        if OPENROUTER_API_KEY and (now - last_ai_check > AI_CHECK_INTERVAL):
+            ai_boxes = request_ai_debris_boxes(display)
+            new_ai_mask = boxes_to_mask(ai_boxes, frame.shape)
+            ai_area = np.count_nonzero(new_ai_mask)
+            ai_debris_mask = new_ai_mask
+            ai_debris_pct = min((ai_area / pool_area) * 100.0, 100.0)
+            print(f"AI debris coverage: {ai_debris_pct:.1f}%")
+            last_ai_check = now
+
         cv2.polylines(display, [POOL_POLYGON], True, (255, 0, 0), 2)
 
         bar_color = (0, 0, 255) if debris_pct >= DEBRIS_THRESHOLD else (0, 255, 0)
         cv2.putText(display, f"Debris: {debris_pct:.1f}%", (10, 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, bar_color, 2)
 
-        # Small coverage bar under the text
+        if OPENROUTER_API_KEY:
+            cv2.putText(display, f"AI Debris: {ai_debris_pct:.1f}%", (10, 85),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+            if ai_debris_mask is not None:
+                ai_contours, _ = cv2.findContours(ai_debris_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for c in ai_contours:
+                    area = cv2.contourArea(c)
+                    if area < MIN_CONTOUR_AREA:
+                        continue
+                    x, y, w, h = cv2.boundingRect(c)
+                    cv2.rectangle(display, (x, y), (x + w, y + h), (255, 0, 255), 2)
+
         bar_w = 200
         filled = int(bar_w * debris_pct / 100.0)
         cv2.rectangle(display, (10, 45), (10 + bar_w, 58), (60, 60, 60), -1)
@@ -506,9 +790,7 @@ proc_thread.start()
 
 
 # -------------------------
-# MAIN THREAD — display + input only
-# waitKey(16) keeps the window responsive at ~60fps.
-# Calibration is also handled here so cv2 windows stay on one thread.
+# MAIN THREAD
 # -------------------------
 
 while True:
@@ -524,23 +806,20 @@ while True:
 
     key = cv2.waitKey(16)
 
-    if key == 27:   # ESC
+    if key == 27:
         break
-
     elif key == ord('c'):
-        # Run calibration on main thread (cv2 windows must stay on one thread)
-        ret, cal_frame = cap.read()
+        ret, _ = cap.read()
         if ret:
             new_mean, new_std = run_water_calibration(cap)
             with lock:
                 water_mean = new_mean
-                water_std  = new_std
-
+                water_std = new_std
     elif key == ord('d'):
         with lock:
             debug_mode = not debug_mode
         print("Debug mode:", "ON" if debug_mode else "OFF")
 
-
 cap.release()
+sleep_inhibitor.stop()
 cv2.destroyAllWindows()
